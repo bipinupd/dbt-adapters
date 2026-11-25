@@ -802,29 +802,197 @@ class BigQueryAdapter(BaseAdapter):
     def get_table_ref_from_relation(self, relation: BaseRelation):
         return self.connections.table_ref(relation.database, relation.schema, relation.identifier)
 
-    def _update_column_dict(self, bq_column_dict, dbt_columns, parent=""):
+    @staticmethod
+    def _parse_data_governance_tags(column_name: str, raw_tags: Any) -> Dict[str, str]:
+        """Validate and normalize a column's ``data_governance_tags`` mapping.
+
+        Expects a mapping of ``{'<parent_id>/<tag_key_short_name>': '<tag_value_short_name>'}``
+        matching BigQuery's ``TableFieldSchema.dataGovernanceTagsInfo.dataGovernanceTags``
+        wire format (where ``parent_id`` is a GCP project ID, project number, or
+        organization ID). An empty mapping (``{}``) is valid and clears any
+        attached data governance tags on the column.
+        """
+        if not isinstance(raw_tags, Mapping):
+            raise dbt_common.exceptions.CompilationError(
+                f"Invalid `data_governance_tags` for column '{column_name}': "
+                "expected a mapping of {'<parent_id>/<tag_key>': '<tag_value>'}, "
+                f"got {type(raw_tags).__name__}."
+            )
+
+        parsed: Dict[str, str] = {}
+        for key, value in raw_tags.items():
+            if not isinstance(key, str):
+                raise dbt_common.exceptions.CompilationError(
+                    f"Invalid `data_governance_tags` key for column '{column_name}': "
+                    f"expected string in '<parent_id>/<tag_key>' format, got {type(key).__name__}."
+                )
+            parts = key.split("/")
+            if (
+                len(parts) != 2
+                or not parts[0]
+                or not parts[1]
+                or any(ch.isspace() for ch in key)
+            ):
+                raise dbt_common.exceptions.CompilationError(
+                    f"Invalid `data_governance_tags` key '{key}' for column '{column_name}': "
+                    "expected '<parent_id>/<tag_key>' (e.g. 'my-project/data_class' or "
+                    "'123456789/data_class') with no whitespace."
+                )
+            if not isinstance(value, str) or not value.strip() or value != value.strip():
+                raise dbt_common.exceptions.CompilationError(
+                    f"Invalid `data_governance_tags` value for key '{key}' on column "
+                    f"'{column_name}': expected a non-empty tag value short name string "
+                    "without leading or trailing whitespace."
+                )
+            if "/" in value:
+                raise dbt_common.exceptions.CompilationError(
+                    f"Invalid `data_governance_tags` value '{value}' for key '{key}' on column "
+                    f"'{column_name}': BigQuery expects the leaf tag value short name "
+                    "(e.g. 'email'), not a hierarchical path."
+                )
+            parsed[key] = value
+        return parsed
+
+    @staticmethod
+    def _has_existing_data_governance_tags(bq_column_dict: Mapping[str, Any]) -> bool:
+        """Return True if a raw BigQuery schema field currently carries a data governance tag."""
+        dgt_info = bq_column_dict.get("dataGovernanceTagsInfo")
+        if isinstance(dgt_info, Mapping):
+            existing = dgt_info.get("dataGovernanceTags")
+            if isinstance(existing, Mapping) and len(existing) > 0:
+                return True
+        return False
+
+    @staticmethod
+    def _extract_table_schema_dicts(table: BigQueryTable) -> List[Dict[str, Any]]:
+        """Return deep copies of raw BigQuery schema field dicts.
+
+        Prefer ``table.to_api_repr()`` so optional fields such as
+        ``dataGovernanceTagsInfo`` are read verbatim before ``SchemaField``
+        processing. Falls back to ``table.schema`` for minimal mock tables.
+        """
+        to_api_repr = getattr(table, "to_api_repr", None)
+        if callable(to_api_repr):
+            api_repr = to_api_repr()
+            if isinstance(api_repr, Mapping):
+                schema = api_repr.get("schema")
+                if isinstance(schema, Mapping) and isinstance(schema.get("fields"), list):
+                    return copy.deepcopy(schema["fields"])
+        return [copy.deepcopy(bq_column.to_api_repr()) for bq_column in table.schema]
+
+    @staticmethod
+    def _extract_string_policy_tags(raw_policy_tags: Any) -> List[str]:
+        """Return non-empty string BigQuery Data Catalog policy tag URIs.
+
+        Non-BigQuery mapping entries (e.g. Snowflake masking-policy dicts) and
+        blank/whitespace-only strings are ignored so cross-adapter ``policy_tags``
+        declarations do not trigger false-positive mutual-exclusivity errors.
+        """
+        if raw_policy_tags is None:
+            return []
+        if isinstance(raw_policy_tags, str):
+            return [raw_policy_tags] if raw_policy_tags.strip() else []
+        if isinstance(raw_policy_tags, Mapping):
+            return []
+        if isinstance(raw_policy_tags, Iterable):
+            return [pt for pt in raw_policy_tags if isinstance(pt, str) and pt.strip()]
+        return []
+
+    @staticmethod
+    def _lookup_column_config(
+        dotted_column_name: str,
+        dbt_columns: Mapping[str, Any],
+        lower_lookup: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Mapping[str, Any]]:
+        """Look up a dbt column config, falling back case-insensitively when unquoted."""
+        if dotted_column_name in dbt_columns:
+            return dbt_columns[dotted_column_name]
+        if lower_lookup is not None:
+            return lower_lookup.get(dotted_column_name.lower())
+        target_lower = dotted_column_name.lower()
+        for key, cfg in dbt_columns.items():
+            if key.lower() == target_lower and not (isinstance(cfg, Mapping) and cfg.get("quote")):
+                return cfg
+        return None
+
+    def _update_column_dict(
+        self,
+        bq_column_dict,
+        dbt_columns,
+        parent="",
+        *,
+        is_table: bool = True,
+        _lower_lookup: Optional[Mapping[str, Any]] = None,
+    ):
         """
         Helper function to recursively traverse the schema of a table in the
-        update_column_descriptions function below.
+        update_columns function below.
 
         bq_column_dict should be a dict as obtained by the to_api_repr()
-        function of a SchemaField object.
+        function of a SchemaField object (or raw TableFieldSchema API dict).
         """
         if parent:
             dotted_column_name = "{}.{}".format(parent, bq_column_dict["name"])
         else:
             dotted_column_name = bq_column_dict["name"]
 
-        if dotted_column_name in dbt_columns:
-            column_config = dbt_columns[dotted_column_name]
+        column_config = self._lookup_column_config(
+            dotted_column_name, dbt_columns, _lower_lookup
+        )
+        if column_config is not None:
             bq_column_dict["description"] = column_config.get("description")
-            if bq_column_dict["type"] != "RECORD":
-                bq_column_dict["policyTags"] = {"names": column_config.get("policy_tags", list())}
+
+            raw_dgt = column_config.get("data_governance_tags")
+            parsed_dgt = (
+                self._parse_data_governance_tags(dotted_column_name, raw_dgt)
+                if raw_dgt is not None
+                else None
+            )
+            is_record = bq_column_dict.get("type") in ("RECORD", "STRUCT")
+
+            if is_record:
+                if parsed_dgt:
+                    raise dbt_common.exceptions.CompilationError(
+                        f"Column '{dotted_column_name}' is a RECORD/STRUCT column and cannot "
+                        "have `data_governance_tags` attached directly. Attach "
+                        "`data_governance_tags` to its leaf subfields instead."
+                    )
+            else:
+                policy_tags = self._extract_string_policy_tags(column_config.get("policy_tags"))
+
+                if parsed_dgt and not is_table:
+                    raise dbt_common.exceptions.CompilationError(
+                        f"Column '{dotted_column_name}' specifies `data_governance_tags`, "
+                        "which BigQuery only supports on table columns (not views, "
+                        "materialized views, snapshots, or external tables)."
+                    )
+                if policy_tags and parsed_dgt:
+                    raise dbt_common.exceptions.CompilationError(
+                        f"Column '{dotted_column_name}' cannot specify both `policy_tags` "
+                        "and `data_governance_tags`. BigQuery does not allow both on the "
+                        "same column."
+                    )
+
+                bq_column_dict["policyTags"] = {"names": policy_tags}
+
+                if parsed_dgt:
+                    bq_column_dict["dataGovernanceTagsInfo"] = {
+                        "dataGovernanceTags": parsed_dgt
+                    }
+                elif is_table and (
+                    self._has_existing_data_governance_tags(bq_column_dict)
+                    or (parsed_dgt is not None and len(parsed_dgt) == 0)
+                ):
+                    bq_column_dict["dataGovernanceTagsInfo"] = {"dataGovernanceTags": {}}
 
         new_fields = []
         for child_col_dict in bq_column_dict.get("fields", list()):
             new_child_column_dict = self._update_column_dict(
-                child_col_dict, dbt_columns, parent=dotted_column_name
+                child_col_dict,
+                dbt_columns,
+                parent=dotted_column_name,
+                is_table=is_table,
+                _lower_lookup=_lower_lookup,
             )
             new_fields.append(new_child_column_dict)
 
@@ -847,10 +1015,25 @@ class BigQueryAdapter(BaseAdapter):
         table_ref = self.get_table_ref_from_relation(relation)
         table = conn.handle.get_table(table_ref)
 
+        table_type = getattr(table, "table_type", None)
+        if isinstance(table_type, str):
+            is_table = table_type.upper() == "TABLE"
+        elif hasattr(relation, "type") and relation.type is not None:
+            is_table = relation.type == RelationType.Table
+        else:
+            is_table = True
+
+        lower_lookup = {
+            key.lower(): cfg
+            for key, cfg in columns.items()
+            if not (isinstance(cfg, Mapping) and cfg.get("quote"))
+        }
+
         new_schema = []
-        for bq_column in table.schema:
-            bq_column_dict = bq_column.to_api_repr()
-            new_bq_column_dict = self._update_column_dict(bq_column_dict, columns)
+        for bq_column_dict in self._extract_table_schema_dicts(table):
+            new_bq_column_dict = self._update_column_dict(
+                bq_column_dict, columns, is_table=is_table, _lower_lookup=lower_lookup
+            )
             new_schema.append(SchemaField.from_api_repr(new_bq_column_dict))
 
         new_table = google.cloud.bigquery.Table(table_ref, schema=new_schema)
